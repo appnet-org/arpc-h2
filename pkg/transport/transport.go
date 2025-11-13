@@ -17,6 +17,7 @@ import (
 	"github.com/appnet-org/arpc/pkg/logging"
 	"go.uber.org/zap"
 	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
 // GenerateRPCID creates a unique RPC ID
@@ -57,17 +58,23 @@ func NewHTTP2TransportWithBalancer(address string, resolver *balancer.Resolver) 
 		handler:     nil,
 	}
 
+	mux := http.NewServeMux()
+
 	// Configure HTTP/2 server (handler will be set by SetHandler)
 	server := &http.Server{
-		Addr: address,
+		Addr:    address,
+		Handler: h2c.NewHandler(mux, &http2.Server{}),
 	}
-
-	// Enable HTTP/2
-	http2.ConfigureServer(server, &http2.Server{})
 
 	transport.server = server
 
 	return transport, nil
+}
+
+func (t *HTTP2Transport) SetHandler(handler http.HandlerFunc) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", handler)
+	t.server.Handler = h2c.NewHandler(mux, &http2.Server{})
 }
 
 // NewHTTP2ClientTransport creates an HTTP/2 transport for client use
@@ -76,8 +83,9 @@ func NewHTTP2ClientTransport() (*HTTP2Transport, error) {
 	client := &http.Client{
 		Transport: &http2.Transport{
 			AllowHTTP: true,
-			DialTLS: func(network, addr string, cfg *tls.Config) (net.Conn, error) {
-				return net.Dial(network, addr)
+			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, network, addr)
 			},
 		},
 		Timeout: 30 * time.Second,
@@ -318,14 +326,6 @@ func (t *HTTP2Transport) ListenAndServeTLS(certFile, keyFile string) error {
 		return fmt.Errorf("ListenAndServeTLS can only be called on a server transport")
 	}
 	return t.server.ListenAndServeTLS(certFile, keyFile)
-}
-
-// SetHandler sets a custom handler for the server (server only)
-func (t *HTTP2Transport) SetHandler(handler http.HandlerFunc) {
-	if t.isServer {
-		t.handler = handler
-		t.server.Handler = handler
-	}
 }
 
 // ReassembleDataPacket processes data packets through the reassembly layer

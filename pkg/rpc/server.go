@@ -9,10 +9,10 @@ import (
 	"net"
 	"net/http"
 
-	"github.com/appnet-org/arpc-h2/pkg/packet"
-	"github.com/appnet-org/arpc-h2/pkg/transport"
 	"github.com/appnet-org/arpc-h2/pkg/logging"
+	"github.com/appnet-org/arpc-h2/pkg/packet"
 	"github.com/appnet-org/arpc-h2/pkg/serializer"
+	"github.com/appnet-org/arpc-h2/pkg/transport"
 	"go.uber.org/zap"
 )
 
@@ -119,10 +119,9 @@ func (s *Server) frameResponse(service, method string, payload []byte) ([]byte, 
 // Start begins listening for incoming RPC requests, dispatching to the appropriate service/method handler.
 func (s *Server) Start() {
 	logging.Info("Server started... Waiting for HTTP/2 connections.")
-	
-	// Set up handler for HTTP/2 requests
+
 	s.transport.SetHandler(s.handleHTTP2Request)
-	
+
 	// Start HTTP/2 server
 	if err := s.transport.ListenAndServe(); err != nil {
 		logging.Error("Error starting HTTP/2 server", zap.Error(err))
@@ -238,7 +237,7 @@ func (s *Server) sendResponse(w http.ResponseWriter, rpcID uint64, data []byte, 
 
 	// Create a reassembler for fragmenting the response
 	reassembler := transport.NewDataReassembler()
-	
+
 	// Fragment the data into packets
 	packets, err := reassembler.FragmentData(data, rpcID, packetTypeID, dstIP, dstPort, srcIP, srcPort)
 	if err != nil {
