@@ -4,8 +4,8 @@ set -ex
 # Get the absolute path to this script
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Push to repo root (assumes script is in examples/echo_symphony/)
-pushd "${SCRIPT_DIR}/../../" > /dev/null
+# Push to repo root
+pushd "${SCRIPT_DIR}/../" > /dev/null
 
 # Build settings
 DOCKERFILE_PATH="${SCRIPT_DIR}/Dockerfile"
