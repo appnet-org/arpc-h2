@@ -613,11 +613,6 @@ func handleHTTP2Connection(clientConn net.Conn, preface []byte, state *ProxyStat
 	}
 
 	// Create buffered readers for framing
-	// Note: We do NOT include the preface in clientReader because:
-	// 1. The preface has already been consumed from the client connection
-	// 2. The preface has been sent to the target
-	// 3. http2.Framer expects to read frames, not the preface
-	// The SETTINGS frame (and other frames) are still in the clientConn TCP buffer
 	clientReader := bufio.NewReader(clientConn)
 	targetReader := bufio.NewReader(targetConn)
 
@@ -625,19 +620,21 @@ func handleHTTP2Connection(clientConn net.Conn, preface []byte, state *ProxyStat
 	wg.Add(2)
 
 	// Handle client -> target (requests)
-	// Reads from client, buffers frames, writes to target when stream ends
-	// Use clientConn as the key for buffering (identifies the source connection)
+	// Source for data is clientReader.
+	// Source for WindowUpdates (to keep data flowing) is clientConn.
 	go func() {
 		defer wg.Done()
-		handleHTTP2Stream(clientReader, targetConn, state, ctx, true, clientConn)
+		// Args: reader, dest, sourceForUpdates, state, ctx, isRequest, bufferKey
+		handleHTTP2Stream(clientReader, targetConn, clientConn, state, ctx, true, clientConn)
 	}()
 
 	// Handle target -> client (responses)
-	// Reads from target, buffers frames, writes to client when stream ends
-	// Use clientConn as the key for buffering (identifies which client to send to)
+	// Source for data is targetReader.
+	// Source for WindowUpdates (to keep data flowing) is targetConn (THE SERVER).
 	go func() {
 		defer wg.Done()
-		handleHTTP2Stream(targetReader, clientConn, state, ctx, false, clientConn)
+		// Args: reader, dest, sourceForUpdates, state, ctx, isRequest, bufferKey
+		handleHTTP2Stream(targetReader, clientConn, targetConn, state, ctx, false, clientConn)
 	}()
 
 	wg.Wait()
@@ -715,13 +712,18 @@ func processStreamThroughElementChain(ctx context.Context, state *ProxyState, co
 
 // handleHTTP2Stream processes HTTP/2 frames in a stream direction
 // Buffers stream-specific frames and flushes them when END_STREAM is received
-func handleHTTP2Stream(reader *bufio.Reader, destConn io.Writer, state *ProxyState, ctx context.Context, isRequest bool, connKey net.Conn) {
+// Added sourceConn argument to send flow control updates back to the correct sender
+func handleHTTP2Stream(reader *bufio.Reader, destConn io.Writer, sourceConn io.Writer, state *ProxyState, ctx context.Context, isRequest bool, connKey net.Conn) {
 	// Create a framer that reads from the source
-	// We'll create buffer-specific framers for writing to buffers
 	readFramer := http2.NewFramer(nil, reader)
 
 	// Direct framer for connection-level frames (SETTINGS, PING, GOAWAY, WINDOW_UPDATE)
 	directFramer := http2.NewFramer(destConn, nil)
+
+	// [FIX] Create a Source Framer using the dedicated sourceConn
+	// For Requests: sourceConn = Client (We tell Client to send more)
+	// For Responses: sourceConn = Server (We tell Server to send more)
+	sourceFramer := http2.NewFramer(sourceConn, nil)
 
 	for {
 		frame, err := readFramer.ReadFrame()
@@ -771,6 +773,27 @@ func handleHTTP2Stream(reader *bufio.Reader, destConn io.Writer, state *ProxySta
 				zap.Bool("endStream", f.StreamEnded()),
 				zap.Bool("isRequest", isRequest),
 				zap.String("connKey", connKey.RemoteAddr().String()))
+
+			// [FIX] Send Window Updates to the correct Source
+			if len(data) > 0 {
+				increment := uint32(len(data))
+
+				// 1. Send Connection-level Window Update (Stream ID 0)
+				if err := sourceFramer.WriteWindowUpdate(0, increment); err != nil {
+					logging.Error("Failed to send connection window update", zap.Error(err))
+					return
+				}
+
+				// 2. Send Stream-level Window Update (Current Stream ID)
+				if err := sourceFramer.WriteWindowUpdate(f.StreamID, increment); err != nil {
+					logging.Error("Failed to send stream window update", zap.Error(err))
+					return
+				}
+
+				logging.Debug("Sent Window Update to source",
+					zap.Uint32("streamID", f.StreamID),
+					zap.Uint32("increment", increment))
+			}
 
 			// If stream ended, process through element chain and flush buffer
 			if f.StreamEnded() {
