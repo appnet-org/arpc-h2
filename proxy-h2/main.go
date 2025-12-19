@@ -125,10 +125,19 @@ type HeaderInfo struct {
 	IsComplete bool // true when EndHeaders is set
 }
 
+// decoderKey identifies an HPACK decoder for a given connection direction.
+// HTTP/2 HPACK uses independent compression tables per direction (headers
+// sent by client vs headers sent by server), so we must not share a single
+// decoder across both request and response directions.
+type decoderKey struct {
+	Conn      net.Conn
+	IsRequest bool
+}
+
 // HeaderManager manages per-stream decoded headers
 type HeaderManager struct {
 	headers  map[StreamBufferKey]*HeaderInfo
-	decoders map[net.Conn]*hpack.Decoder // HPACK decoder per connection
+	decoders map[decoderKey]*hpack.Decoder // HPACK decoder per connection *and* direction
 	mu       sync.RWMutex
 }
 
@@ -136,7 +145,7 @@ type HeaderManager struct {
 func NewHeaderManager() *HeaderManager {
 	return &HeaderManager{
 		headers:  make(map[StreamBufferKey]*HeaderInfo),
-		decoders: make(map[net.Conn]*hpack.Decoder),
+		decoders: make(map[decoderKey]*hpack.Decoder),
 	}
 }
 
@@ -153,8 +162,8 @@ func (m *HeaderManager) DecodeAndStoreHeaders(conn net.Conn, streamID uint32, bl
 			IsComplete: false,
 		}
 	}
-	// Get decoder for this connection (must hold lock to get decoder safely)
-	decoder := m.getDecoderUnsafe(conn)
+	// Get decoder for this connection and direction (must hold lock)
+	decoder := m.getDecoderUnsafe(conn, isRequest)
 	m.mu.Unlock()
 
 	// Set the emit function to capture decoded header fields for this specific stream
@@ -190,14 +199,15 @@ func (m *HeaderManager) DecodeAndStoreHeaders(conn net.Conn, streamID uint32, bl
 
 // getDecoderUnsafe returns or creates an HPACK decoder for a connection
 // Must be called while holding m.mu lock
-func (m *HeaderManager) getDecoderUnsafe(conn net.Conn) *hpack.Decoder {
-	if decoder, exists := m.decoders[conn]; exists {
+func (m *HeaderManager) getDecoderUnsafe(conn net.Conn, isRequest bool) *hpack.Decoder {
+	key := decoderKey{Conn: conn, IsRequest: isRequest}
+	if decoder, exists := m.decoders[key]; exists {
 		return decoder
 	}
 
 	// Create decoder with a no-op callback (we'll set it per-stream in DecodeAndStoreHeaders)
 	decoder := hpack.NewDecoder(4096, func(hpack.HeaderField) {}) // 4096 is the default dynamic table size
-	m.decoders[conn] = decoder
+	m.decoders[key] = decoder
 	return decoder
 }
 
@@ -275,8 +285,16 @@ func (m *HeaderManager) RemoveAllForConnection(conn net.Conn) {
 		delete(m.headers, key)
 	}
 
-	// Remove decoder for this connection
-	delete(m.decoders, conn)
+	// Remove decoders for this connection (both directions)
+	var decoderKeysToDelete []decoderKey
+	for key := range m.decoders {
+		if key.Conn == conn {
+			decoderKeysToDelete = append(decoderKeysToDelete, key)
+		}
+	}
+	for _, dk := range decoderKeysToDelete {
+		delete(m.decoders, dk)
+	}
 }
 
 // NewStreamBufferManager creates a new StreamBufferManager
@@ -756,25 +774,13 @@ func handleHTTP2Stream(reader *bufio.Reader, destConn io.Writer, sourceConn io.W
 				zap.ByteString("data", data),
 				zap.Bool("isRequest", isRequest))
 
-			// Get or create buffer for this stream (keyed by connection + stream ID)
-			buf := state.bufferManager.GetOrCreateBuffer(connKey, f.StreamID)
-
-			// Create a framer that writes to the buffer
-			bufFramer := http2.NewFramer(buf, nil)
-
-			// Write DATA frame to buffer
-			if err := bufFramer.WriteData(f.StreamID, f.StreamEnded(), data); err != nil {
-				logging.Error("Error writing DATA frame to buffer", zap.Error(err))
+			// Forward DATA frame immediately to preserve HTTP/2 and HPACK ordering
+			if err := directFramer.WriteData(f.StreamID, f.StreamEnded(), data); err != nil {
+				logging.Error("Error forwarding DATA frame", zap.Error(err))
 				return
 			}
 
-			logging.Debug("Buffered DATA frame",
-				zap.Uint32("streamID", f.StreamID),
-				zap.Bool("endStream", f.StreamEnded()),
-				zap.Bool("isRequest", isRequest),
-				zap.String("connKey", connKey.RemoteAddr().String()))
-
-			// [FIX] Send Window Updates to the correct Source
+			// Send Window Updates to the correct Source
 			if len(data) > 0 {
 				increment := uint32(len(data))
 
@@ -795,32 +801,12 @@ func handleHTTP2Stream(reader *bufio.Reader, destConn io.Writer, sourceConn io.W
 					zap.Uint32("increment", increment))
 			}
 
-			// If stream ended, process through element chain and flush buffer
+			// If stream ended, just clean up per-stream state
 			if f.StreamEnded() {
-				// Process through element chain before flushing
-				verdict, shouldFlush := processStreamThroughElementChain(ctx, state, connKey, f.StreamID, isRequest, buf)
-				if !shouldFlush {
-					// Stream was dropped by element chain
-					logging.Debug("Stream dropped by element chain",
-						zap.Uint32("streamID", f.StreamID),
-						zap.Bool("isRequest", isRequest),
-						zap.String("verdict", verdict.String()))
-					// Remove buffer without flushing
-					state.bufferManager.FlushAndRemove(connKey, f.StreamID, io.Discard)
-					state.headerManager.RemoveHeaders(connKey, f.StreamID)
-					state.payloadManager.RemovePayload(connKey, f.StreamID)
-					return
-				}
-
-				// Flush buffer to destination
-				if err := state.bufferManager.FlushAndRemove(connKey, f.StreamID, destConn); err != nil {
-					logging.Error("Error flushing stream buffer", zap.Error(err))
-					return
-				}
 				// Clean up headers and payload for this stream
 				state.headerManager.RemoveHeaders(connKey, f.StreamID)
 				state.payloadManager.RemovePayload(connKey, f.StreamID)
-				logging.Debug("Flushed stream buffer",
+				logging.Debug("Completed stream",
 					zap.Uint32("streamID", f.StreamID),
 					zap.Bool("isRequest", isRequest),
 					zap.String("connKey", connKey.RemoteAddr().String()))
@@ -850,39 +836,28 @@ func handleHTTP2Stream(reader *bufio.Reader, destConn io.Writer, sourceConn io.W
 				}
 			}
 
-			// Get or create buffer for this stream (keyed by connection + stream ID)
-			buf := state.bufferManager.GetOrCreateBuffer(connKey, f.StreamID)
-
-			// Create a framer that writes to the buffer
-			bufFramer := http2.NewFramer(buf, nil)
-
-			// Write HEADERS frame to buffer
-			if err := bufFramer.WriteHeaders(http2.HeadersFrameParam{
+			// Forward HEADERS frame immediately to preserve header ordering
+			if err := directFramer.WriteHeaders(http2.HeadersFrameParam{
 				StreamID:      f.StreamID,
 				BlockFragment: blockFragment,
 				EndHeaders:    f.HeadersEnded(),
 				EndStream:     f.StreamEnded(),
 				Priority:      f.Priority,
 			}); err != nil {
-				logging.Error("Error writing HEADERS frame to buffer", zap.Error(err))
+				logging.Error("Error forwarding HEADERS frame", zap.Error(err))
 				return
 			}
 
-			logging.Debug("Buffered HEADERS frame",
+			logging.Debug("Forwarded HEADERS frame",
 				zap.Uint32("streamID", f.StreamID),
 				zap.Bool("endStream", f.StreamEnded()),
 				zap.Bool("isRequest", isRequest),
 				zap.String("connKey", connKey.RemoteAddr().String()))
 
-			// If stream ended, flush buffer to destination and clean up headers
+			// If stream ended, clean up headers
 			if f.StreamEnded() {
-				if err := state.bufferManager.FlushAndRemove(connKey, f.StreamID, destConn); err != nil {
-					logging.Error("Error flushing stream buffer", zap.Error(err))
-					return
-				}
-				// Clean up headers for this stream
 				state.headerManager.RemoveHeaders(connKey, f.StreamID)
-				logging.Debug("Flushed stream buffer",
+				logging.Debug("Completed header-only stream",
 					zap.Uint32("streamID", f.StreamID),
 					zap.Bool("isRequest", isRequest),
 					zap.String("connKey", connKey.RemoteAddr().String()))
@@ -944,9 +919,6 @@ func handleHTTP2Stream(reader *bufio.Reader, destConn io.Writer, sourceConn io.W
 				return
 			}
 
-			// Clean up all headers and decoders for this connection
-			state.headerManager.RemoveAllForConnection(connKey)
-
 			// Forward GOAWAY frame (connection-level)
 			if err := directFramer.WriteGoAway(f.StreamID, f.ErrCode, f.DebugData()); err != nil {
 				logging.Error("Error writing GOAWAY frame", zap.Error(err))
@@ -954,23 +926,14 @@ func handleHTTP2Stream(reader *bufio.Reader, destConn io.Writer, sourceConn io.W
 			}
 
 		case *http2.RSTStreamFrame:
-			// Buffer RST_STREAM frame (stream-level)
-			buf := state.bufferManager.GetOrCreateBuffer(connKey, f.StreamID)
-			bufFramer := http2.NewFramer(buf, nil)
-
-			if err := bufFramer.WriteRSTStream(f.StreamID, f.ErrCode); err != nil {
-				logging.Error("Error writing RST_STREAM frame to buffer", zap.Error(err))
+			// Forward RST_STREAM immediately and clean up headers
+			if err := directFramer.WriteRSTStream(f.StreamID, f.ErrCode); err != nil {
+				logging.Error("Error forwarding RST_STREAM frame", zap.Error(err))
 				return
 			}
 
-			// RST_STREAM ends the stream, flush buffer and clean up headers
-			if err := state.bufferManager.FlushAndRemove(connKey, f.StreamID, destConn); err != nil {
-				logging.Error("Error flushing stream buffer after RST_STREAM", zap.Error(err))
-				return
-			}
-			// Clean up headers for this stream
 			state.headerManager.RemoveHeaders(connKey, f.StreamID)
-			logging.Debug("Flushed stream buffer after RST_STREAM",
+			logging.Debug("Forwarded RST_STREAM and cleaned up headers",
 				zap.Uint32("streamID", f.StreamID),
 				zap.Bool("isRequest", isRequest),
 				zap.String("connKey", connKey.RemoteAddr().String()))
@@ -983,19 +946,43 @@ func handleHTTP2Stream(reader *bufio.Reader, destConn io.Writer, sourceConn io.W
 					return
 				}
 			} else {
-				// Stream-specific flow control - buffer with stream
-				buf := state.bufferManager.GetOrCreateBuffer(connKey, f.StreamID)
-				bufFramer := http2.NewFramer(buf, nil)
-				if err := bufFramer.WriteWindowUpdate(f.StreamID, f.Increment); err != nil {
-					logging.Error("Error writing WINDOW_UPDATE frame to buffer", zap.Error(err))
+				// Stream-specific flow control - forward immediately
+				if err := directFramer.WriteWindowUpdate(f.StreamID, f.Increment); err != nil {
+					logging.Error("Error writing WINDOW_UPDATE frame", zap.Error(err))
 					return
 				}
-				logging.Debug("Buffered WINDOW_UPDATE frame",
+				logging.Debug("Forwarded WINDOW_UPDATE frame",
 					zap.Uint32("streamID", f.StreamID),
 					zap.Uint32("increment", f.Increment),
 					zap.Bool("isRequest", isRequest),
 					zap.String("connKey", connKey.RemoteAddr().String()))
 			}
+
+		case *http2.ContinuationFrame:
+			// Handle header block CONTINUATION frames.
+			// These carry additional HPACK-encoded header fragments for an
+			// existing HEADERS block.
+
+			blockFragment := f.HeaderBlockFragment()
+
+			// Feed continuation fragment into the HPACK decoder so that
+			// HeaderManager has the complete logical header block.
+			if err := state.headerManager.DecodeAndStoreHeaders(connKey, f.StreamID, blockFragment, f.HeadersEnded(), isRequest); err != nil {
+				logging.Error("Error decoding continuation headers", zap.Error(err))
+				// Continue proxying even if decoding fails.
+			}
+
+			// Forward CONTINUATION frame immediately to preserve header block ordering.
+			if err := directFramer.WriteContinuation(f.StreamID, f.HeadersEnded(), blockFragment); err != nil {
+				logging.Error("Error forwarding CONTINUATION frame", zap.Error(err))
+				return
+			}
+
+			logging.Debug("Forwarded CONTINUATION frame",
+				zap.Uint32("streamID", f.StreamID),
+				zap.Bool("endHeaders", f.HeadersEnded()),
+				zap.Bool("isRequest", isRequest),
+				zap.String("connKey", connKey.RemoteAddr().String()))
 
 		default:
 			// For other frame types, log and skip
