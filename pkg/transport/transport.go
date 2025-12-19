@@ -25,6 +25,82 @@ func GenerateRPCID() uint64 {
 	return uint64(time.Now().UnixNano())
 }
 
+// responseDispatcher manages response routing by RPC ID
+// Optimized for high-concurrency scenarios with sync.Map for better performance
+type responseDispatcher struct {
+	responses   sync.Map // map[uint64]chan *responseData - using sync.Map for better concurrent performance
+	pendingData sync.Map // map[uint64]*responseData - store responses that arrive before registration
+}
+
+type responseData struct {
+	data       []byte
+	addr       *net.TCPAddr
+	rpcID      uint64
+	packetType packet.PacketTypeID
+	err        error
+}
+
+func newResponseDispatcher() *responseDispatcher {
+	return &responseDispatcher{}
+}
+
+func (d *responseDispatcher) register(rpcID uint64) chan *responseData {
+	ch := make(chan *responseData, 1)
+	d.responses.Store(rpcID, ch)
+	
+	// Check if there's pending data for this RPC ID (common case: no pending data)
+	if pending, exists := d.pendingData.LoadAndDelete(rpcID); exists {
+		// Send the pending data immediately (non-blocking)
+		select {
+		case ch <- pending.(*responseData):
+		default:
+			// Channel is full, this shouldn't happen with buffered channel
+			logging.Debug("Failed to send pending data to channel", zap.Uint64("rpcID", rpcID))
+		}
+	}
+	
+	return ch
+}
+
+func (d *responseDispatcher) unregister(rpcID uint64) {
+	if chVal, exists := d.responses.LoadAndDelete(rpcID); exists {
+		ch := chVal.(chan *responseData)
+		close(ch)
+	}
+	// Also clean up any pending data
+	d.pendingData.Delete(rpcID)
+}
+
+// dispatch routes a response to the appropriate channel based on RPC ID
+// Optimized for the common case where the channel is already registered
+func (d *responseDispatcher) dispatch(data []byte, addr *net.TCPAddr, rpcID uint64, packetType packet.PacketTypeID, err error) {
+	respData := &responseData{
+		data:       data,
+		addr:       addr,
+		rpcID:      rpcID,
+		packetType: packetType,
+		err:        err,
+	}
+	
+	// Fast path: check if channel is registered (most common case)
+	if chVal, exists := d.responses.Load(rpcID); exists {
+		ch := chVal.(chan *responseData)
+		// Non-blocking send to avoid goroutine blocking
+		select {
+		case ch <- respData:
+			// Successfully dispatched
+			return
+		default:
+			// Channel is full or closed (shouldn't happen with buffered channel)
+			logging.Debug("Response channel full or closed for RPC ID", zap.Uint64("rpcID", rpcID))
+		}
+	}
+	
+	// Slow path: no one is registered yet, store the response for later
+	d.pendingData.Store(rpcID, respData)
+	logging.Debug("Storing response for later delivery", zap.Uint64("rpcID", rpcID))
+}
+
 type HTTP2Transport struct {
 	server      *http.Server
 	client      *http.Client
@@ -34,6 +110,7 @@ type HTTP2Transport struct {
 	handler     http.HandlerFunc
 	streams     map[uint64]*streamContext
 	streamMutex sync.RWMutex
+	dispatcher  *responseDispatcher
 }
 
 type streamContext struct {
@@ -56,6 +133,7 @@ func NewHTTP2TransportWithBalancer(address string, resolver *balancer.Resolver) 
 		isServer:    true,
 		streams:     make(map[uint64]*streamContext),
 		handler:     nil,
+		dispatcher:  newResponseDispatcher(),
 	}
 
 	mux := http.NewServeMux()
@@ -97,6 +175,7 @@ func NewHTTP2ClientTransport() (*HTTP2Transport, error) {
 		resolver:    balancer.DefaultResolver(),
 		isServer:    false,
 		streams:     make(map[uint64]*streamContext),
+		dispatcher:  newResponseDispatcher(),
 	}
 
 	return transport, nil
@@ -109,6 +188,7 @@ func NewHTTP2TransportForStream(resolver *balancer.Resolver) *HTTP2Transport {
 		resolver:    resolver,
 		isServer:    true,
 		streams:     make(map[uint64]*streamContext),
+		dispatcher:  newResponseDispatcher(),
 	}
 }
 
@@ -190,20 +270,74 @@ func (t *HTTP2Transport) Send(addr string, rpcID uint64, data []byte, packetType
 			return fmt.Errorf("failed to read response: %w", err)
 		}
 
-		// Store response in stream context
-		t.streamMutex.Lock()
-		ctx := &streamContext{
-			dataChan:   make(chan []byte, 1),
-			addr:       nil, // Client doesn't need addr
-			rpcID:      rpcID,
-			packetType: packetTypeID,
-			errChan:    make(chan error, 1),
+		// Process the response and dispatch it
+		// Check if channel is already registered (optimization: avoid goroutine if possible)
+		if _, registered := t.dispatcher.responses.Load(rpcID); registered {
+			// Channel is already registered, process synchronously for better performance
+			// Process the received data
+			data, addr, processedRPCID, pktType, processErr := t.ProcessReceivedData(respBody, nil, rpcID, packetTypeID, packet.MaxTCPPayloadSize)
+			
+			if processErr != nil {
+				t.dispatcher.dispatch(nil, nil, rpcID, packet.PacketTypeUnknown, processErr)
+				return nil
+			}
+			
+			// Dispatch the response (may be nil if still waiting for fragments)
+			if data != nil {
+				t.dispatcher.dispatch(data, addr, processedRPCID, pktType, nil)
+			} else {
+				// If data is nil, it means we're still waiting for fragments
+				// This shouldn't happen for HTTP/2 as all fragments should be in the response body
+				// But if it does, we should dispatch an error
+				t.dispatcher.dispatch(nil, nil, rpcID, packet.PacketTypeUnknown, fmt.Errorf("incomplete fragments received"))
+			}
+		} else {
+			// Channel not registered yet, process in goroutine to avoid blocking Send()
+			go func() {
+				// Process the received data
+				data, addr, processedRPCID, pktType, processErr := t.ProcessReceivedData(respBody, nil, rpcID, packetTypeID, packet.MaxTCPPayloadSize)
+				
+				if processErr != nil {
+					t.dispatcher.dispatch(nil, nil, rpcID, packet.PacketTypeUnknown, processErr)
+					return
+				}
+				
+				// Dispatch the response (may be nil if still waiting for fragments)
+				if data != nil {
+					t.dispatcher.dispatch(data, addr, processedRPCID, pktType, nil)
+				} else {
+					// If data is nil, it means we're still waiting for fragments
+					// This shouldn't happen for HTTP/2 as all fragments should be in the response body
+					// But if it does, we should dispatch an error
+					t.dispatcher.dispatch(nil, nil, rpcID, packet.PacketTypeUnknown, fmt.Errorf("incomplete fragments received"))
+				}
+			}()
 		}
-		ctx.dataChan <- respBody
-		t.streams[rpcID] = ctx
-		t.streamMutex.Unlock()
 
 		return nil
+	}
+}
+
+// ReceiveForRPC waits for a response for a specific RPC ID and returns the response data.
+// This method should be used by clients to receive responses for specific RPC calls.
+// It blocks until a response is received for the given RPC ID or an error occurs.
+func (t *HTTP2Transport) ReceiveForRPC(ctx context.Context, rpcID uint64, bufferSize int) ([]byte, *net.TCPAddr, uint64, packet.PacketTypeID, error) {
+	// Register for this specific RPC ID
+	responseChan := t.dispatcher.register(rpcID)
+	defer t.dispatcher.unregister(rpcID)
+
+	// Wait for response
+	select {
+	case respData := <-responseChan:
+		if respData == nil {
+			return nil, nil, 0, packet.PacketTypeUnknown, fmt.Errorf("response channel closed")
+		}
+		if respData.err != nil {
+			return nil, nil, 0, packet.PacketTypeUnknown, respData.err
+		}
+		return respData.data, respData.addr, respData.rpcID, respData.packetType, nil
+	case <-ctx.Done():
+		return nil, nil, 0, packet.PacketTypeUnknown, ctx.Err()
 	}
 }
 
@@ -214,6 +348,7 @@ func (t *HTTP2Transport) Send(addr string, rpcID uint64, data []byte, packetType
 // * RPC id
 // * packet type
 // * error
+// NOTE: This method is deprecated for client use. Use ReceiveForRPC instead for proper RPC ID matching.
 func (t *HTTP2Transport) Receive(bufferSize int) ([]byte, *net.TCPAddr, uint64, packet.PacketTypeID, error) {
 	// For server, we need to check if we have any completed streams
 	if t.isServer {
@@ -369,6 +504,20 @@ func (t *HTTP2Transport) Close() error {
 		close(ctx.errChan)
 	}
 	t.streams = make(map[uint64]*streamContext)
+
+	// Clean up dispatcher: close all response channels and clear pending data
+	if t.dispatcher != nil {
+		t.dispatcher.responses.Range(func(key, value interface{}) bool {
+			ch := value.(chan *responseData)
+			close(ch)
+			t.dispatcher.responses.Delete(key)
+			return true
+		})
+		t.dispatcher.pendingData.Range(func(key, value interface{}) bool {
+			t.dispatcher.pendingData.Delete(key)
+			return true
+		})
+	}
 
 	return err
 }

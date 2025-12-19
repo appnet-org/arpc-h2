@@ -150,34 +150,24 @@ func (c *Client) Call(ctx context.Context, service, method string, req any, resp
 		return fmt.Errorf("failed to send request: %w", err)
 	}
 
-	// Wait and process the response
-	for {
-		data, _, respID, packetTypeID, err := c.transport.Receive(packet.MaxTCPPayloadSize)
-		if err != nil {
-			return fmt.Errorf("failed to receive response: %w", err)
-		}
+	// Wait and process the response using the dispatcher
+	data, _, respID, packetTypeID, err := c.transport.ReceiveForRPC(ctx, rpcReqID, packet.MaxTCPPayloadSize)
+	if err != nil {
+		return fmt.Errorf("failed to receive response: %w", err)
+	}
 
-		if data == nil {
-			continue // Either still waiting for fragments or we received an non-data/error packet
-		}
+	if data == nil {
+		return fmt.Errorf("received nil data for RPC ID %d", rpcReqID)
+	}
 
-		if respID != rpcReqID {
-			logging.Debug("Ignoring response with mismatched RPC ID",
-				zap.Uint64("receivedID", respID),
-				zap.Uint64("expectedID", rpcReqID))
-			continue
-		}
-
-		// Process the packet based on its type
-		switch packetTypeID {
-		case packet.PacketTypeData:
-			return c.handleResponsePacket(data, respID, resp)
-		case packet.PacketTypeError, packet.PacketTypeUnknown:
-			return c.handleErrorPacket(string(data), packetTypeID)
-		default:
-			logging.Debug("Ignoring packet with unknown type", zap.Uint8("packetTypeID", uint8(packetTypeID)))
-			continue
-		}
+	// Process the packet based on its type
+	switch packetTypeID {
+	case packet.PacketTypeData:
+		return c.handleResponsePacket(data, respID, resp)
+	case packet.PacketTypeError, packet.PacketTypeUnknown:
+		return c.handleErrorPacket(string(data), packetTypeID)
+	default:
+		return fmt.Errorf("unknown packet type: %d", packetTypeID)
 	}
 }
 
