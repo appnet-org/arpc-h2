@@ -11,6 +11,7 @@ import (
 
 	"github.com/appnet-org/arpc-h2/pkg/logging"
 	"github.com/appnet-org/arpc-h2/pkg/packet"
+	"github.com/appnet-org/arpc-h2/pkg/rpc/element"
 	"github.com/appnet-org/arpc-h2/pkg/serializer"
 	"github.com/appnet-org/arpc-h2/pkg/transport"
 	"go.uber.org/zap"
@@ -34,21 +35,23 @@ type ServiceDesc struct {
 
 // Server is the core RPC server handling transport, serialization, and registered services.
 type Server struct {
-	transport  *transport.HTTP2Transport
-	serializer serializer.Serializer
-	services   map[string]*ServiceDesc
+	transport       *transport.HTTP2Transport
+	serializer      serializer.Serializer
+	services        map[string]*ServiceDesc
+	rpcElementChain *element.RPCElementChain
 }
 
 // NewServer initializes a new Server instance with the given address and serializer.
-func NewServer(addr string, serializer serializer.Serializer) (*Server, error) {
+func NewServer(addr string, serializer serializer.Serializer, rpcElements ...element.RPCElement) (*Server, error) {
 	http2Transport, err := transport.NewHTTP2Transport(addr)
 	if err != nil {
 		return nil, err
 	}
 	return &Server{
-		transport:  http2Transport,
-		serializer: serializer,
-		services:   make(map[string]*ServiceDesc),
+		transport:       http2Transport,
+		serializer:      serializer,
+		services:        make(map[string]*ServiceDesc),
+		rpcElementChain: element.NewRPCElementChain(rpcElements...),
 	}, nil
 }
 
@@ -174,6 +177,34 @@ func (s *Server) handleHTTP2Request(w http.ResponseWriter, r *http.Request) {
 	// Create context
 	ctx := context.Background()
 
+	// Create RPC request for element processing
+	rpcReq := &element.RPCRequest{
+		ID:          rpcID,
+		ServiceName: serviceName,
+		Method:      methodName,
+		Payload:     reqPayloadBytes,
+	}
+
+	// Process request through RPC elements
+	rpcReq, ctx, err = s.rpcElementChain.ProcessRequest(ctx, rpcReq)
+	if err != nil {
+		s.sendErrorResponse(w, rpcID, []byte(err.Error()), packet.PacketTypeUnknown)
+		return
+	}
+
+	switch payload := rpcReq.Payload.(type) {
+	case nil:
+		reqPayloadBytes = nil
+	case []byte:
+		reqPayloadBytes = payload
+	default:
+		reqPayloadBytes, err = s.serializer.Marshal(payload)
+		if err != nil {
+			s.sendErrorResponse(w, rpcID, []byte(err.Error()), packet.PacketTypeUnknown)
+			return
+		}
+	}
+
 	// Lookup service and method
 	svcDesc, ok := s.services[serviceName]
 	if !ok {
@@ -196,6 +227,18 @@ func (s *Server) handleHTTP2Request(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		var errType packet.PacketTypeID
+		rpcResp := &element.RPCResponse{
+			ID:     rpcID,
+			Result: nil,
+			Error:  err,
+		}
+		rpcResp, _, chainErr := s.rpcElementChain.ProcessResponse(ctx, rpcResp)
+		if chainErr != nil {
+			err = chainErr
+		} else if rpcResp.Error != nil {
+			err = rpcResp.Error
+		}
+
 		if rpcErr, ok := err.(*RPCError); ok && rpcErr.Type == RPCFailError {
 			errType = packet.PacketTypeError
 		} else {
@@ -206,8 +249,32 @@ func (s *Server) handleHTTP2Request(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Create response for RPC element processing
+	rpcResp := &element.RPCResponse{
+		ID:     rpcID,
+		Result: resp,
+		Error:  nil,
+	}
+
+	rpcResp, ctx, err = s.rpcElementChain.ProcessResponse(ctx, rpcResp)
+	if err != nil {
+		s.sendErrorResponse(w, rpcID, []byte(err.Error()), packet.PacketTypeUnknown)
+		return
+	}
+	if rpcResp.Error != nil {
+		var errType packet.PacketTypeID
+		if rpcErr, ok := rpcResp.Error.(*RPCError); ok && rpcErr.Type == RPCFailError {
+			errType = packet.PacketTypeError
+		} else {
+			errType = packet.PacketTypeUnknown
+			logging.Error("Handler error", zap.Error(rpcResp.Error))
+		}
+		s.sendErrorResponse(w, rpcID, []byte(rpcResp.Error.Error()), errType)
+		return
+	}
+
 	// Serialize response
-	respPayloadBytes, err := s.serializer.Marshal(resp)
+	respPayloadBytes, err := s.serializer.Marshal(rpcResp.Result)
 	if err != nil {
 		logging.Error("Error marshaling response", zap.Error(err))
 		s.sendErrorResponse(w, rpcID, []byte(err.Error()), packet.PacketTypeUnknown)

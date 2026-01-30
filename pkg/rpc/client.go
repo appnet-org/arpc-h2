@@ -8,6 +8,7 @@ import (
 
 	"github.com/appnet-org/arpc-h2/pkg/logging"
 	"github.com/appnet-org/arpc-h2/pkg/packet"
+	"github.com/appnet-org/arpc-h2/pkg/rpc/element"
 	"github.com/appnet-org/arpc-h2/pkg/serializer"
 	"github.com/appnet-org/arpc-h2/pkg/transport"
 	"go.uber.org/zap"
@@ -15,32 +16,34 @@ import (
 
 // Client represents an RPC client with a transport and serializer.
 type Client struct {
-	transport   *transport.HTTP2Transport
-	serializer  serializer.Serializer
-	defaultAddr string
+	transport       *transport.HTTP2Transport
+	serializer      serializer.Serializer
+	defaultAddr     string
+	rpcElementChain *element.RPCElementChain
 }
 
 // NewClient creates a new Client using the given serializer and target address.
 // The client will create an HTTP/2 connection to the server.
-func NewClient(serializer serializer.Serializer, addr string) (*Client, error) {
+func NewClient(serializer serializer.Serializer, addr string, rpcElements ...element.RPCElement) (*Client, error) {
 	t, err := transport.NewHTTP2ClientTransport()
 	if err != nil {
 		return nil, err
 	}
 	return &Client{
-		transport:   t,
-		serializer:  serializer,
-		defaultAddr: addr,
+		transport:       t,
+		serializer:      serializer,
+		defaultAddr:     addr,
+		rpcElementChain: element.NewRPCElementChain(rpcElements...),
 	}, nil
 }
 
 // NewClientWithLocalAddr creates a new Client using the given serializer, target address, and local address.
 // Note: For HTTP/2, the local address is not used in the same way as UDP.
 // This function is kept for API compatibility but the localAddr parameter is ignored.
-func NewClientWithLocalAddr(serializer serializer.Serializer, addr, localAddr string) (*Client, error) {
+func NewClientWithLocalAddr(serializer serializer.Serializer, addr, localAddr string, rpcElements ...element.RPCElement) (*Client, error) {
 	// For HTTP/2, we don't bind to a local address in the same way
 	// The OS will assign a local port when we connect
-	return NewClient(serializer, addr)
+	return NewClient(serializer, addr, rpcElements...)
 }
 
 // Transport returns the underlying HTTP/2 transport for cleanup purposes
@@ -102,7 +105,19 @@ func (c *Client) parseFramedResponse(data []byte) (service string, method string
 	return service, method, payload, nil
 }
 
-func (c *Client) handleErrorPacket(errMsg string, errType packet.PacketTypeID) error {
+func (c *Client) handleErrorPacket(ctx context.Context, errMsg string, errType packet.PacketTypeID) error {
+	// Create error response for RPC element processing
+	rpcResp := &element.RPCResponse{
+		Result: nil,
+		Error:  fmt.Errorf("server error: %s", errMsg),
+	}
+
+	// Process error response through RPC elements
+	_, _, err := c.rpcElementChain.ProcessResponse(ctx, rpcResp)
+	if err != nil {
+		return err
+	}
+
 	var rpcErrType RPCErrorType
 	if errType == packet.PacketTypeError {
 		rpcErrType = RPCFailError
@@ -112,7 +127,7 @@ func (c *Client) handleErrorPacket(errMsg string, errType packet.PacketTypeID) e
 	return &RPCError{Type: rpcErrType, Reason: errMsg}
 }
 
-func (c *Client) handleResponsePacket(data []byte, rpcID uint64, resp any) error {
+func (c *Client) handleResponsePacket(ctx context.Context, data []byte, rpcID uint64, resp any) error {
 	// Parse framed response: extract service, method, payload
 	_, _, respPayloadBytes, err := c.parseFramedResponse(data)
 	if err != nil {
@@ -126,27 +141,54 @@ func (c *Client) handleResponsePacket(data []byte, rpcID uint64, resp any) error
 
 	logging.Debug("Successfully received response", zap.Uint64("rpcID", rpcID))
 
-	return nil
+	// Create response for RPC element processing
+	rpcResp := &element.RPCResponse{
+		ID:     rpcID,
+		Result: resp,
+		Error:  nil,
+	}
+
+	// Process response through RPC elements
+	rpcResp, ctx, err = c.rpcElementChain.ProcessResponse(ctx, rpcResp)
+	if err != nil {
+		return err
+	}
+
+	return rpcResp.Error
 }
 
-// Call makes an RPC call
+// Call makes an RPC call with RPC element processing
 func (c *Client) Call(ctx context.Context, service, method string, req any, resp any) error {
 	rpcReqID := transport.GenerateRPCID()
 
+	// Create request with service and method information
+	rpcReq := &element.RPCRequest{
+		ServiceName: service,
+		Method:      method,
+		ID:          rpcReqID,
+		Payload:     req,
+	}
+
+	// Process request through RPC elements
+	rpcReq, ctx, err := c.rpcElementChain.ProcessRequest(ctx, rpcReq)
+	if err != nil {
+		return err
+	}
+
 	// Serialize the request payload
-	reqPayloadBytes, err := c.serializer.Marshal(req)
+	reqPayloadBytes, err := c.serializer.Marshal(rpcReq.Payload)
 	if err != nil {
 		return fmt.Errorf("failed to marshal request: %w", err)
 	}
 
 	// Frame the request into binary format
-	framedReq, err := c.frameRequest(service, method, reqPayloadBytes)
+	framedReq, err := c.frameRequest(rpcReq.ServiceName, rpcReq.Method, reqPayloadBytes)
 	if err != nil {
 		return fmt.Errorf("failed to frame request: %w", err)
 	}
 
 	// Send the framed request
-	if err := c.transport.Send(c.defaultAddr, rpcReqID, framedReq, packet.PacketTypeData); err != nil {
+	if err := c.transport.Send(c.defaultAddr, rpcReq.ID, framedReq, packet.PacketTypeData); err != nil {
 		return fmt.Errorf("failed to send request: %w", err)
 	}
 
@@ -163,9 +205,9 @@ func (c *Client) Call(ctx context.Context, service, method string, req any, resp
 	// Process the packet based on its type
 	switch packetTypeID {
 	case packet.PacketTypeData:
-		return c.handleResponsePacket(data, respID, resp)
+		return c.handleResponsePacket(ctx, data, respID, resp)
 	case packet.PacketTypeError, packet.PacketTypeUnknown:
-		return c.handleErrorPacket(string(data), packetTypeID)
+		return c.handleErrorPacket(ctx, string(data), packetTypeID)
 	default:
 		return fmt.Errorf("unknown packet type: %d", packetTypeID)
 	}
