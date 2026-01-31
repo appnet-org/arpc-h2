@@ -20,6 +20,7 @@ type Client struct {
 	serializer      serializer.Serializer
 	defaultAddr     string
 	rpcElementChain *element.RPCElementChain
+	streamingMode   bool
 }
 
 // NewClient creates a new Client using the given serializer and target address.
@@ -49,6 +50,22 @@ func NewClientWithLocalAddr(serializer serializer.Serializer, addr, localAddr st
 // Transport returns the underlying HTTP/2 transport for cleanup purposes
 func (c *Client) Transport() *transport.HTTP2Transport {
 	return c.transport
+}
+
+// EnableStreaming enables streaming mode for the client
+// In streaming mode, all RPCs are sent over a persistent HTTP/2 stream
+// which reduces per-RPC overhead significantly
+func (c *Client) EnableStreaming() error {
+	if err := c.transport.EnableStreaming(c.defaultAddr); err != nil {
+		return fmt.Errorf("failed to enable streaming: %w", err)
+	}
+	c.streamingMode = true
+	return nil
+}
+
+// IsStreamingEnabled returns whether streaming mode is enabled
+func (c *Client) IsStreamingEnabled() bool {
+	return c.streamingMode && c.transport.IsStreamingEnabled()
 }
 
 // frameRequest constructs a binary message with
@@ -187,29 +204,50 @@ func (c *Client) Call(ctx context.Context, service, method string, req any, resp
 		return fmt.Errorf("failed to frame request: %w", err)
 	}
 
-	// Send the framed request
-	if err := c.transport.Send(c.defaultAddr, rpcReq.ID, framedReq, packet.PacketTypeData); err != nil {
-		return fmt.Errorf("failed to send request: %w", err)
+	// Register for response before sending (to avoid race condition)
+	responseChan := c.transport.GetDispatcher().Register(rpcReq.ID)
+	defer c.transport.GetDispatcher().Unregister(rpcReq.ID)
+
+	// Send the framed request (use streaming if enabled)
+	if c.IsStreamingEnabled() {
+		if err := c.transport.SendStreaming(rpcReq.ID, framedReq, packet.PacketTypeData); err != nil {
+			return fmt.Errorf("failed to send streaming request: %w", err)
+		}
+	} else {
+		if err := c.transport.Send(c.defaultAddr, rpcReq.ID, framedReq, packet.PacketTypeData); err != nil {
+			return fmt.Errorf("failed to send request: %w", err)
+		}
 	}
 
-	// Wait and process the response using the dispatcher
-	data, _, respID, packetTypeID, err := c.transport.ReceiveForRPC(ctx, rpcReqID, packet.MaxTCPPayloadSize)
-	if err != nil {
-		return fmt.Errorf("failed to receive response: %w", err)
-	}
+	// Wait for response
+	select {
+	case respData := <-responseChan:
+		if respData == nil {
+			return fmt.Errorf("response channel closed")
+		}
+		if respData.Err != nil {
+			return respData.Err
+		}
 
-	if data == nil {
-		return fmt.Errorf("received nil data for RPC ID %d", rpcReqID)
-	}
+		data := respData.Data
+		respID := respData.RPCID
+		packetTypeID := respData.PacketType
 
-	// Process the packet based on its type
-	switch packetTypeID {
-	case packet.PacketTypeData:
-		return c.handleResponsePacket(ctx, data, respID, resp)
-	case packet.PacketTypeError, packet.PacketTypeUnknown:
-		return c.handleErrorPacket(ctx, string(data), packetTypeID)
-	default:
-		return fmt.Errorf("unknown packet type: %d", packetTypeID)
+		if data == nil {
+			return fmt.Errorf("received nil data for RPC ID %d", rpcReqID)
+		}
+
+		// Process the packet based on its type
+		switch packetTypeID {
+		case packet.PacketTypeData:
+			return c.handleResponsePacket(ctx, data, respID, resp)
+		case packet.PacketTypeError, packet.PacketTypeUnknown:
+			return c.handleErrorPacket(ctx, string(data), packetTypeID)
+		default:
+			return fmt.Errorf("unknown packet type: %d", packetTypeID)
+		}
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

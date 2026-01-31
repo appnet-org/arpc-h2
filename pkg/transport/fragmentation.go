@@ -4,9 +4,7 @@ import (
 	"net"
 	"sync"
 
-	"github.com/appnet-org/arpc/pkg/logging"
 	protocol "github.com/appnet-org/arpc-h2/pkg/packet"
-	"go.uber.org/zap"
 )
 
 // DataReassembler handles the reassembly of fragmented data (request/response) packets
@@ -25,23 +23,32 @@ func NewDataReassembler() *DataReassembler {
 // ProcessFragment processes a single data packet fragment and returns the reassembled message if complete
 func (r *DataReassembler) ProcessFragment(pkt any, addr *net.TCPAddr) ([]byte, *net.TCPAddr, uint64, bool) {
 	dataPkt := pkt.(*protocol.DataPacket)
-	// log the peer and source port
-	logging.Debug("Processing fragment", zap.String("peer", addr.String()), zap.Uint16("srcPort", dataPkt.SrcPort))
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	// Fast path: single-packet message (most common case for small payloads)
+	if dataPkt.TotalPackets == 1 {
+		return dataPkt.Payload, addr, dataPkt.RPCID, true
+	}
+
 	// Initialize fragment map for this RPC if it doesn't exist
 	if _, exists := r.incoming[dataPkt.RPCID]; !exists {
-		r.incoming[dataPkt.RPCID] = make(map[uint16][]byte)
+		r.incoming[dataPkt.RPCID] = make(map[uint16][]byte, dataPkt.TotalPackets)
 	}
 
 	r.incoming[dataPkt.RPCID][dataPkt.SeqNumber] = dataPkt.Payload
 
 	// Check if we have all fragments
 	if len(r.incoming[dataPkt.RPCID]) == int(dataPkt.TotalPackets) {
+		// Pre-calculate total size to avoid reallocations
+		totalSize := 0
+		for _, fragment := range r.incoming[dataPkt.RPCID] {
+			totalSize += len(fragment)
+		}
+
 		// Reassemble the complete message by concatenating fragments in order
-		var fullMessage []byte
+		fullMessage := make([]byte, 0, totalSize)
 		for i := uint16(0); i < dataPkt.TotalPackets; i++ {
 			fullMessage = append(fullMessage, r.incoming[dataPkt.RPCID][i]...)
 		}
@@ -58,29 +65,30 @@ func (r *DataReassembler) ProcessFragment(pkt any, addr *net.TCPAddr) ([]byte, *
 // FragmentData splits data into multiple packets for Data (Request/Response) packets
 func (r *DataReassembler) FragmentData(data []byte, rpcID uint64, packetTypeID protocol.PacketTypeID, dstIP [4]byte, dstPort uint16, srcIP [4]byte, srcPort uint16) ([]any, error) {
 	if packetTypeID == protocol.PacketTypeError || packetTypeID == protocol.PacketTypeUnknown {
-		packets := []any{}
-		packets = append(packets, &protocol.ErrorPacket{
+		return []any{&protocol.ErrorPacket{
 			RPCID:    rpcID,
 			ErrorMsg: string(data),
-		})
-		return packets, nil
+		}}, nil
 	}
+
 	// Calculate chunk size by subtracting header overhead from max TCP payload
 	// New header size: 1+8+2+2+4+2+4+2+4 = 29 bytes
 	chunkSize := protocol.MaxTCPPayloadSize - 29
 	totalPackets := uint16((len(data) + chunkSize - 1) / chunkSize)
-	var packets []any
 
-	for i := range int(totalPackets) {
+	// Pre-allocate packets slice
+	packets := make([]any, 0, totalPackets)
+
+	for i := uint16(0); i < totalPackets; i++ {
 		// Calculate start and end indices for current chunk
-		start := i * chunkSize
+		start := int(i) * chunkSize
 		end := min(start+chunkSize, len(data))
 
 		// Create a packet for the current chunk
 		pkt := &protocol.DataPacket{
 			RPCID:        rpcID,
 			TotalPackets: totalPackets,
-			SeqNumber:    uint16(i),
+			SeqNumber:    i,
 			DstIP:        dstIP,
 			DstPort:      dstPort,
 			SrcIP:        srcIP,

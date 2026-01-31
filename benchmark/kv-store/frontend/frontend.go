@@ -136,11 +136,24 @@ func main() {
 	}
 
 	serializer := &serializer.SymphonySerializer{}
-	// client, err := rpc.NewClient(serializer, "localhost:11000")
+	// client, err := rpc.NewClient(serializer, ":11000")
 	client, err := rpc.NewClient(serializer, "kvstore.default.svc.cluster.local:11000")
 	if err != nil {
 		logging.Fatal("Failed to create RPC client", zap.Error(err))
 	}
+
+	// Check if streaming mode is enabled via environment variable
+	streamingMode := os.Getenv("STREAMING_MODE")
+	if streamingMode == "true" || streamingMode == "1" {
+		logging.Info("Enabling streaming mode for RPC client")
+		if err := client.EnableStreaming(); err != nil {
+			logging.Fatal("Failed to enable streaming mode", zap.Error(err))
+		}
+		logging.Info("Streaming mode enabled successfully")
+	} else {
+		logging.Info("Using unary mode for RPC client (set STREAMING_MODE=true to enable streaming)")
+	}
+
 	kvClient = &arpch2KVServiceClient{client: client}
 
 	http.HandleFunc("/", handler)

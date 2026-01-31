@@ -123,7 +123,7 @@ func (s *Server) frameResponse(service, method string, payload []byte) ([]byte, 
 func (s *Server) Start() {
 	logging.Info("Server started... Waiting for HTTP/2 connections.")
 
-	s.transport.SetHandler(s.handleHTTP2Request)
+	s.transport.SetHandlers(s.handleHTTP2Request, s.handleStreamingRequest)
 
 	// Start HTTP/2 server
 	if err := s.transport.ListenAndServe(); err != nil {
@@ -291,6 +291,236 @@ func (s *Server) handleHTTP2Request(w http.ResponseWriter, r *http.Request) {
 
 	// Send the response via HTTP/2
 	s.sendResponse(w, rpcID, framedResp, packet.PacketTypeData)
+}
+
+// handleStreamingRequest handles persistent HTTP/2 streaming connections
+func (s *Server) handleStreamingRequest(w http.ResponseWriter, r *http.Request) {
+	// Extract remote address
+	remoteAddr := r.RemoteAddr
+	tcpAddr, err := net.ResolveTCPAddr("tcp", remoteAddr)
+	if err != nil {
+		http.Error(w, "Failed to resolve remote address", http.StatusBadRequest)
+		return
+	}
+
+	logging.Info("New streaming connection", zap.String("addr", remoteAddr))
+
+	// Create stream writer for responses (thread-safe)
+	streamWriter := transport.NewStreamWriter(w)
+	defer streamWriter.Close()
+
+	// Create reassembler for this connection
+	reassembler := transport.NewDataReassembler()
+
+	// Create stream reader for requests
+	streamReader := transport.NewStreamReader(r.Body)
+	defer r.Body.Close()
+
+	// Create transport instance for packet processing
+	connTransport := transport.NewHTTP2TransportForStream(s.transport.GetResolver())
+
+	// Set response headers for streaming
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Transfer-Encoding", "chunked")
+	w.WriteHeader(http.StatusOK)
+
+	// Flush headers
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+
+	// Read and process packets from the stream
+	for {
+		result, err := streamReader.ReadAndProcessPacket(connTransport, tcpAddr)
+		if err != nil {
+			if err == io.EOF {
+				logging.Debug("Streaming client disconnected", zap.String("addr", remoteAddr))
+			} else {
+				logging.Error("Error reading from stream", zap.Error(err), zap.String("addr", remoteAddr))
+			}
+			return
+		}
+
+		if !result.IsComplete {
+			// Still waiting for more fragments
+			continue
+		}
+
+		// Process complete RPC request in a goroutine
+		go s.handleStreamingRPC(result, streamWriter, reassembler)
+	}
+}
+
+// handleStreamingRPC processes a single RPC request from a streaming connection
+func (s *Server) handleStreamingRPC(result *transport.ProcessPacketResult, streamWriter *transport.StreamWriter, reassembler *transport.DataReassembler) {
+	rpcID := result.RPCID
+	data := result.Data
+
+	// Parse request payload
+	serviceName, methodName, reqPayloadBytes, err := s.parseFramedRequest(data)
+	if err != nil {
+		logging.Error("Failed to parse framed request", zap.Error(err))
+		s.sendStreamingErrorResponse(streamWriter, reassembler, rpcID, []byte(err.Error()), packet.PacketTypeUnknown)
+		return
+	}
+
+	// Create context
+	ctx := context.Background()
+
+	// Create RPC request for element processing
+	rpcReq := &element.RPCRequest{
+		ID:          rpcID,
+		ServiceName: serviceName,
+		Method:      methodName,
+		Payload:     reqPayloadBytes,
+	}
+
+	// Process request through RPC elements
+	rpcReq, ctx, err = s.rpcElementChain.ProcessRequest(ctx, rpcReq)
+	if err != nil {
+		s.sendStreamingErrorResponse(streamWriter, reassembler, rpcID, []byte(err.Error()), packet.PacketTypeUnknown)
+		return
+	}
+
+	switch payload := rpcReq.Payload.(type) {
+	case nil:
+		reqPayloadBytes = nil
+	case []byte:
+		reqPayloadBytes = payload
+	default:
+		reqPayloadBytes, err = s.serializer.Marshal(payload)
+		if err != nil {
+			s.sendStreamingErrorResponse(streamWriter, reassembler, rpcID, []byte(err.Error()), packet.PacketTypeUnknown)
+			return
+		}
+	}
+
+	// Lookup service and method
+	svcDesc, ok := s.services[serviceName]
+	if !ok {
+		logging.Warn("Unknown service", zap.String("serviceName", serviceName))
+		s.sendStreamingErrorResponse(streamWriter, reassembler, rpcID, []byte("unknown service"), packet.PacketTypeError)
+		return
+	}
+	methodDesc, ok := svcDesc.Methods[methodName]
+	if !ok {
+		logging.Warn("Unknown method",
+			zap.String("serviceName", serviceName),
+			zap.String("methodName", methodName))
+		s.sendStreamingErrorResponse(streamWriter, reassembler, rpcID, []byte("unknown method"), packet.PacketTypeError)
+		return
+	}
+
+	// Invoke method handler
+	resp, err := methodDesc.Handler(svcDesc.ServiceImpl, ctx, func(v any) error {
+		return s.serializer.Unmarshal(reqPayloadBytes, v)
+	})
+	if err != nil {
+		var errType packet.PacketTypeID
+		rpcResp := &element.RPCResponse{
+			ID:     rpcID,
+			Result: nil,
+			Error:  err,
+		}
+		rpcResp, _, chainErr := s.rpcElementChain.ProcessResponse(ctx, rpcResp)
+		if chainErr != nil {
+			err = chainErr
+		} else if rpcResp.Error != nil {
+			err = rpcResp.Error
+		}
+
+		if rpcErr, ok := err.(*RPCError); ok && rpcErr.Type == RPCFailError {
+			errType = packet.PacketTypeError
+		} else {
+			errType = packet.PacketTypeUnknown
+			logging.Error("Handler error", zap.Error(err))
+		}
+		s.sendStreamingErrorResponse(streamWriter, reassembler, rpcID, []byte(err.Error()), errType)
+		return
+	}
+
+	// Create response for RPC element processing
+	rpcResp := &element.RPCResponse{
+		ID:     rpcID,
+		Result: resp,
+		Error:  nil,
+	}
+
+	rpcResp, ctx, err = s.rpcElementChain.ProcessResponse(ctx, rpcResp)
+	if err != nil {
+		s.sendStreamingErrorResponse(streamWriter, reassembler, rpcID, []byte(err.Error()), packet.PacketTypeUnknown)
+		return
+	}
+	if rpcResp.Error != nil {
+		var errType packet.PacketTypeID
+		if rpcErr, ok := rpcResp.Error.(*RPCError); ok && rpcErr.Type == RPCFailError {
+			errType = packet.PacketTypeError
+		} else {
+			errType = packet.PacketTypeUnknown
+			logging.Error("Handler error", zap.Error(rpcResp.Error))
+		}
+		s.sendStreamingErrorResponse(streamWriter, reassembler, rpcID, []byte(rpcResp.Error.Error()), errType)
+		return
+	}
+
+	// Serialize response
+	respPayloadBytes, err := s.serializer.Marshal(rpcResp.Result)
+	if err != nil {
+		logging.Error("Error marshaling response", zap.Error(err))
+		s.sendStreamingErrorResponse(streamWriter, reassembler, rpcID, []byte(err.Error()), packet.PacketTypeUnknown)
+		return
+	}
+
+	// Frame response
+	framedResp, err := s.frameResponse(serviceName, methodName, respPayloadBytes)
+	if err != nil {
+		logging.Error("Failed to frame response", zap.Error(err))
+		s.sendStreamingErrorResponse(streamWriter, reassembler, rpcID, []byte(err.Error()), packet.PacketTypeUnknown)
+		return
+	}
+
+	// Send the response via streaming
+	s.sendStreamingResponse(streamWriter, reassembler, rpcID, framedResp, packet.PacketTypeData)
+}
+
+// sendStreamingResponse sends a response through the streaming connection
+func (s *Server) sendStreamingResponse(streamWriter *transport.StreamWriter, reassembler *transport.DataReassembler, rpcID uint64, data []byte, packetTypeID packet.PacketTypeID) {
+	var dstIP, srcIP [4]byte
+	var dstPort, srcPort uint16
+
+	packets, err := reassembler.FragmentData(data, rpcID, packetTypeID, dstIP, dstPort, srcIP, srcPort)
+	if err != nil {
+		logging.Error("Error fragmenting response", zap.Error(err))
+		return
+	}
+
+	for _, pkt := range packets {
+		var packetData []byte
+		switch p := pkt.(type) {
+		case *packet.DataPacket:
+			packetData, err = packet.SerializeDataPacket(p)
+		case *packet.ErrorPacket:
+			packetData, err = packet.SerializeErrorPacket(p)
+		default:
+			logging.Error("Unknown packet type")
+			return
+		}
+
+		if err != nil {
+			logging.Error("Error serializing packet", zap.Error(err))
+			return
+		}
+
+		if err := streamWriter.WriteFrameAndFlush(packetData); err != nil {
+			logging.Error("Error writing frame to stream", zap.Error(err))
+			return
+		}
+	}
+}
+
+// sendStreamingErrorResponse sends an error response through the streaming connection
+func (s *Server) sendStreamingErrorResponse(streamWriter *transport.StreamWriter, reassembler *transport.DataReassembler, rpcID uint64, errMsg []byte, errType packet.PacketTypeID) {
+	s.sendStreamingResponse(streamWriter, reassembler, rpcID, errMsg, errType)
 }
 
 // sendResponse sends a response through HTTP/2

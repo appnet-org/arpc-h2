@@ -47,7 +47,7 @@ func newResponseDispatcher() *responseDispatcher {
 func (d *responseDispatcher) register(rpcID uint64) chan *responseData {
 	ch := make(chan *responseData, 1)
 	d.responses.Store(rpcID, ch)
-	
+
 	// Check if there's pending data for this RPC ID (common case: no pending data)
 	if pending, exists := d.pendingData.LoadAndDelete(rpcID); exists {
 		// Send the pending data immediately (non-blocking)
@@ -58,7 +58,7 @@ func (d *responseDispatcher) register(rpcID uint64) chan *responseData {
 			logging.Debug("Failed to send pending data to channel", zap.Uint64("rpcID", rpcID))
 		}
 	}
-	
+
 	return ch
 }
 
@@ -71,6 +71,47 @@ func (d *responseDispatcher) unregister(rpcID uint64) {
 	d.pendingData.Delete(rpcID)
 }
 
+// ResponseData is a public wrapper for response data
+type ResponseData struct {
+	Data       []byte
+	Addr       *net.TCPAddr
+	RPCID      uint64
+	PacketType packet.PacketTypeID
+	Err        error
+}
+
+// ResponseDispatcher is a public interface for the response dispatcher
+type ResponseDispatcher struct {
+	d *responseDispatcher
+}
+
+// Register registers for responses for a given RPC ID
+func (rd *ResponseDispatcher) Register(rpcID uint64) <-chan *ResponseData {
+	internalCh := rd.d.register(rpcID)
+	// Create a channel that wraps the internal channel
+	ch := make(chan *ResponseData, 1)
+	go func() {
+		resp := <-internalCh
+		if resp == nil {
+			close(ch)
+			return
+		}
+		ch <- &ResponseData{
+			Data:       resp.data,
+			Addr:       resp.addr,
+			RPCID:      resp.rpcID,
+			PacketType: resp.packetType,
+			Err:        resp.err,
+		}
+	}()
+	return ch
+}
+
+// Unregister unregisters for responses for a given RPC ID
+func (rd *ResponseDispatcher) Unregister(rpcID uint64) {
+	rd.d.unregister(rpcID)
+}
+
 // dispatch routes a response to the appropriate channel based on RPC ID
 // Optimized for the common case where the channel is already registered
 func (d *responseDispatcher) dispatch(data []byte, addr *net.TCPAddr, rpcID uint64, packetType packet.PacketTypeID, err error) {
@@ -81,7 +122,7 @@ func (d *responseDispatcher) dispatch(data []byte, addr *net.TCPAddr, rpcID uint
 		packetType: packetType,
 		err:        err,
 	}
-	
+
 	// Fast path: check if channel is registered (most common case)
 	if chVal, exists := d.responses.Load(rpcID); exists {
 		ch := chVal.(chan *responseData)
@@ -95,7 +136,7 @@ func (d *responseDispatcher) dispatch(data []byte, addr *net.TCPAddr, rpcID uint
 			logging.Debug("Response channel full or closed for RPC ID", zap.Uint64("rpcID", rpcID))
 		}
 	}
-	
+
 	// Slow path: no one is registered yet, store the response for later
 	d.pendingData.Store(rpcID, respData)
 	logging.Debug("Storing response for later delivery", zap.Uint64("rpcID", rpcID))
@@ -111,6 +152,15 @@ type HTTP2Transport struct {
 	streams     map[uint64]*streamContext
 	streamMutex sync.RWMutex
 	dispatcher  *responseDispatcher
+
+	// Streaming client fields
+	streamingMode   bool
+	streamPipeW     *io.PipeWriter
+	streamPipeR     *io.PipeReader
+	streamAddr      string
+	streamReaderWg  sync.WaitGroup
+	streamConnected bool
+	streamMu        sync.Mutex
 }
 
 type streamContext struct {
@@ -155,6 +205,14 @@ func (t *HTTP2Transport) SetHandler(handler http.HandlerFunc) {
 	t.server.Handler = h2c.NewHandler(mux, &http2.Server{})
 }
 
+// SetHandlers sets both unary and stream handlers
+func (t *HTTP2Transport) SetHandlers(unaryHandler, streamHandler http.HandlerFunc) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", unaryHandler)
+	mux.HandleFunc("/stream", streamHandler)
+	t.server.Handler = h2c.NewHandler(mux, &http2.Server{})
+}
+
 // NewHTTP2ClientTransport creates an HTTP/2 transport for client use
 func NewHTTP2ClientTransport() (*HTTP2Transport, error) {
 	// Configure HTTP/2 client
@@ -192,6 +250,117 @@ func NewHTTP2TransportForStream(resolver *balancer.Resolver) *HTTP2Transport {
 	}
 }
 
+// EnableStreaming enables streaming mode for the client transport
+// This establishes a persistent HTTP/2 stream to the given address
+func (t *HTTP2Transport) EnableStreaming(addr string) error {
+	if t.isServer {
+		return fmt.Errorf("EnableStreaming can only be called on a client transport")
+	}
+
+	t.streamMu.Lock()
+	defer t.streamMu.Unlock()
+
+	if t.streamConnected {
+		return nil // Already connected
+	}
+
+	// Create pipe for sending data
+	pipeR, pipeW := io.Pipe()
+	t.streamPipeR = pipeR
+	t.streamPipeW = pipeW
+	t.streamAddr = addr
+	t.streamingMode = true
+
+	// Format URL
+	url := addr
+	if len(url) < 7 || url[:7] != "http://" {
+		url = "http://" + url
+	}
+	url = url + "/stream"
+
+	// Create the streaming request
+	req, err := http.NewRequest("POST", url, pipeR)
+	if err != nil {
+		t.streamPipeW.Close()
+		t.streamPipeR.Close()
+		return fmt.Errorf("failed to create streaming request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+
+	// Start the request in a goroutine
+	t.streamReaderWg.Add(1)
+	go func() {
+		defer t.streamReaderWg.Done()
+		t.runStreamingClient(req)
+	}()
+
+	t.streamConnected = true
+	return nil
+}
+
+// runStreamingClient handles the streaming HTTP/2 connection
+func (t *HTTP2Transport) runStreamingClient(req *http.Request) {
+	resp, err := t.client.Do(req)
+	if err != nil {
+		logging.Error("Streaming connection failed", zap.Error(err))
+		t.streamMu.Lock()
+		t.streamConnected = false
+		t.streamMu.Unlock()
+		return
+	}
+	defer resp.Body.Close()
+
+	// Read responses from the stream
+	reader := NewStreamReader(resp.Body)
+	for {
+		result, err := reader.ReadAndProcessPacket(t, nil)
+		if err != nil {
+			if err == io.EOF {
+				logging.Debug("Stream closed by server")
+			} else {
+				logging.Error("Error reading from stream", zap.Error(err))
+			}
+			break
+		}
+
+		if result.IsComplete {
+			// Dispatch the response
+			var pktType packet.PacketTypeID
+			if result.IsError {
+				pktType = packet.PacketTypeError
+			} else {
+				pktType = packet.PacketTypeData
+			}
+			t.dispatcher.dispatch(result.Data, result.Addr, result.RPCID, pktType, nil)
+		}
+	}
+
+	t.streamMu.Lock()
+	t.streamConnected = false
+	t.streamMu.Unlock()
+}
+
+// SendStreaming sends data over the persistent stream (streaming mode only)
+func (t *HTTP2Transport) SendStreaming(rpcID uint64, data []byte, packetTypeID packet.PacketTypeID) error {
+	t.streamMu.Lock()
+	if !t.streamingMode || !t.streamConnected {
+		t.streamMu.Unlock()
+		return fmt.Errorf("streaming mode not enabled or not connected")
+	}
+	pipeW := t.streamPipeW
+	t.streamMu.Unlock()
+
+	// Fragment and write to the pipe
+	return FragmentAndWriteFrames(pipeW, t.reassembler, data, rpcID, packetTypeID)
+}
+
+// IsStreamingEnabled returns whether streaming mode is enabled
+func (t *HTTP2Transport) IsStreamingEnabled() bool {
+	t.streamMu.Lock()
+	defer t.streamMu.Unlock()
+	return t.streamingMode && t.streamConnected
+}
+
 func (t *HTTP2Transport) Send(addr string, rpcID uint64, data []byte, packetTypeID packet.PacketTypeID) error {
 	if t.isServer {
 		// Server mode: Send is not used directly in HTTP/2 server mode
@@ -224,6 +393,9 @@ func (t *HTTP2Transport) Send(addr string, rpcID uint64, data []byte, packetType
 
 		// Serialize all packets into a single request body
 		var requestData bytes.Buffer
+		lenBuf := lenBufPool.Get().([]byte)
+		defer lenBufPool.Put(lenBuf)
+
 		for _, pkt := range packets {
 			var packetData []byte
 			switch p := pkt.(type) {
@@ -240,9 +412,7 @@ func (t *HTTP2Transport) Send(addr string, rpcID uint64, data []byte, packetType
 			}
 
 			// Write packet length first (4 bytes) for framing
-			packetLen := uint32(len(packetData))
-			lenBuf := make([]byte, 4)
-			binary.LittleEndian.PutUint32(lenBuf, packetLen)
+			binary.LittleEndian.PutUint32(lenBuf, uint32(len(packetData)))
 			requestData.Write(lenBuf)
 			requestData.Write(packetData)
 		}
@@ -276,12 +446,12 @@ func (t *HTTP2Transport) Send(addr string, rpcID uint64, data []byte, packetType
 			// Channel is already registered, process synchronously for better performance
 			// Process the received data
 			data, addr, processedRPCID, pktType, processErr := t.ProcessReceivedData(respBody, nil, rpcID, packetTypeID, packet.MaxTCPPayloadSize)
-			
+
 			if processErr != nil {
 				t.dispatcher.dispatch(nil, nil, rpcID, packet.PacketTypeUnknown, processErr)
 				return nil
 			}
-			
+
 			// Dispatch the response (may be nil if still waiting for fragments)
 			if data != nil {
 				t.dispatcher.dispatch(data, addr, processedRPCID, pktType, nil)
@@ -296,12 +466,12 @@ func (t *HTTP2Transport) Send(addr string, rpcID uint64, data []byte, packetType
 			go func() {
 				// Process the received data
 				data, addr, processedRPCID, pktType, processErr := t.ProcessReceivedData(respBody, nil, rpcID, packetTypeID, packet.MaxTCPPayloadSize)
-				
+
 				if processErr != nil {
 					t.dispatcher.dispatch(nil, nil, rpcID, packet.PacketTypeUnknown, processErr)
 					return
 				}
-				
+
 				// Dispatch the response (may be nil if still waiting for fragments)
 				if data != nil {
 					t.dispatcher.dispatch(data, addr, processedRPCID, pktType, nil)
@@ -493,6 +663,22 @@ func (t *HTTP2Transport) Close() error {
 		t.server = nil
 	}
 
+	// Close streaming resources
+	t.streamMu.Lock()
+	if t.streamPipeW != nil {
+		t.streamPipeW.Close()
+		t.streamPipeW = nil
+	}
+	if t.streamPipeR != nil {
+		t.streamPipeR.Close()
+		t.streamPipeR = nil
+	}
+	t.streamConnected = false
+	t.streamMu.Unlock()
+
+	// Wait for streaming goroutine to finish
+	t.streamReaderWg.Wait()
+
 	if t.client != nil {
 		// HTTP client doesn't need explicit closing in Go
 		t.client = nil
@@ -536,4 +722,9 @@ func (t *HTTP2Transport) LocalAddr() *net.TCPAddr {
 // GetResolver returns the resolver for this transport
 func (t *HTTP2Transport) GetResolver() *balancer.Resolver {
 	return t.resolver
+}
+
+// GetDispatcher returns the response dispatcher for advanced operations
+func (t *HTTP2Transport) GetDispatcher() *ResponseDispatcher {
+	return &ResponseDispatcher{d: t.dispatcher}
 }
