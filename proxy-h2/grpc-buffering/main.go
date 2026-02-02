@@ -17,6 +17,7 @@ import (
 
 	"github.com/appnet-org/arpc/pkg/logging"
 	kv "github.com/appnet-org/proxy-h2/grpc-buffering/kvproto"
+	"github.com/appnet-org/proxy-h2/grpc-buffering/util"
 	"go.uber.org/zap"
 	"golang.org/x/sys/unix"
 
@@ -204,8 +205,8 @@ func truncateForLog(s string) string {
 	return s[:maxLoggedString] + "...(truncated)"
 }
 
-func buildRPCContext(ctx context.Context, fullMethod string, payload []byte, isRequest bool) *GRPCContext {
-	headers := Headers{}
+func buildRPCContext(ctx context.Context, fullMethod string, payload []byte, isRequest bool) *util.GRPCContext {
+	headers := util.Headers{}
 	if md, ok := metadata.FromIncomingContext(ctx); ok {
 		for k, vals := range md {
 			// Metadata keys are lowercase; enforce just in case.
@@ -213,7 +214,7 @@ func buildRPCContext(ctx context.Context, fullMethod string, payload []byte, isR
 		}
 	}
 
-	rpcCtx := &GRPCContext{
+	rpcCtx := &util.GRPCContext{
 		Headers:   headers,
 		Payload:   append([]byte(nil), payload...),
 		IsRequest: isRequest,
@@ -467,7 +468,7 @@ func (s *ProxyState) streamHandler(srv interface{}, ss grpc.ServerStream) error 
 					errCh <- err
 					return
 				}
-				if verdict == VerdictDrop {
+				if verdict == util.VerdictDrop {
 					logging.Debug("Request dropped by element chain",
 						zap.String("method", fullMethod),
 						zap.String("backend", target))
@@ -535,7 +536,7 @@ func (s *ProxyState) streamHandler(srv interface{}, ss grpc.ServerStream) error 
 					errCh <- err
 					return
 				}
-				if verdict == VerdictDrop {
+				if verdict == util.VerdictDrop {
 					logging.Debug("Response dropped by element chain",
 						zap.String("method", fullMethod),
 						zap.String("backend", target))
@@ -675,9 +676,16 @@ func main() {
 
 	logging.Info("Starting gRPC-aware proxy on :15002 and :15006...")
 
+	// Initialize dynamic element loader (plugins)
+	InitElementLoader(ElementPluginDir + "/" + GetElementPluginPrefix())
+
 	config := DefaultConfig()
 
-	elementChain := NewRPCElementChain(&FirewallElement{})
+	elementChain := GetElementChain()
+	if elementChain == nil {
+		elementChain = NewRPCElementChain()
+		logging.Warn("No element chain available, using empty chain")
+	}
 
 	state := &ProxyState{
 		targetAddr:   config.TargetAddr,

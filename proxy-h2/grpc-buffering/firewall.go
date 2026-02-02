@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/appnet-org/arpc/pkg/logging"
+	"github.com/appnet-org/proxy-h2/grpc-buffering/util"
 	"go.uber.org/zap"
 )
 
@@ -12,7 +13,7 @@ type FirewallElement struct{}
 
 func (e *FirewallElement) Name() string { return "firewall-element" }
 
-func (e *FirewallElement) ProcessRequest(ctx context.Context, rpcCtx *GRPCContext) (Verdict, context.Context, error) {
+func (e *FirewallElement) ProcessRequest(ctx context.Context, rpcCtx *util.GRPCContext) (util.Verdict, context.Context, error) {
 	if rpcCtx != nil {
 		logging.Debug("Firewall element: request",
 			zap.String("method", rpcCtx.Method),
@@ -20,10 +21,10 @@ func (e *FirewallElement) ProcessRequest(ctx context.Context, rpcCtx *GRPCContex
 			zap.Int("payload_size", len(rpcCtx.Payload)),
 		)
 	}
-	return VerdictPass, ctx, nil
+	return util.VerdictPass, ctx, nil
 }
 
-func (e *FirewallElement) ProcessResponse(ctx context.Context, rpcCtx *GRPCContext) (Verdict, context.Context, error) {
+func (e *FirewallElement) ProcessResponse(ctx context.Context, rpcCtx *util.GRPCContext) (util.Verdict, context.Context, error) {
 	if rpcCtx != nil {
 		logging.Debug("Firewall element: response",
 			zap.String("method", rpcCtx.Method),
@@ -31,5 +32,5 @@ func (e *FirewallElement) ProcessResponse(ctx context.Context, rpcCtx *GRPCConte
 			zap.Int("payload_size", len(rpcCtx.Payload)),
 		)
 	}
-	return VerdictPass, ctx, nil
+	return util.VerdictPass, ctx, nil
 }
