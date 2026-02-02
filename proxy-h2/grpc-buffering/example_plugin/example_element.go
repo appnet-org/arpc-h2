@@ -9,33 +9,49 @@ package main
 
 import (
 	"context"
+	"math/rand"
+	"sync"
+	"time"
 
 	"github.com/appnet-org/arpc/pkg/logging"
 	"github.com/appnet-org/proxy-h2/grpc-buffering/util"
 	"go.uber.org/zap"
 )
 
-// ExampleElement is a simple example element that logs requests and responses
+// ExampleElement is a simple example element that logs requests/responses
+// and drops each request with 50% probability.
 type ExampleElement struct {
 	name string
+	mu   sync.Mutex
+	rng  *rand.Rand
 }
 
-// ProcessRequest processes incoming requests.
+// ProcessRequest processes incoming requests. Drops each request with 50% probability.
 func (e *ExampleElement) ProcessRequest(ctx context.Context, rpcCtx *util.GRPCContext) (util.Verdict, context.Context, error) {
 	if rpcCtx == nil {
 		return util.VerdictPass, ctx, nil
+	}
+
+	e.mu.Lock()
+	dropThis := e.rng.Float64() < 0.5
+	e.mu.Unlock()
+
+	if dropThis {
+		logging.Info("ExampleElement: Dropping request (50% drop)",
+			zap.String("method", rpcCtx.Method),
+			zap.String("remote", rpcCtx.RemoteAddr),
+			zap.Int("payloadSize", len(rpcCtx.Payload)))
+		return util.VerdictDrop, ctx, nil
 	}
 
 	logging.Info("ExampleElement: Processing request",
 		zap.String("method", rpcCtx.Method),
 		zap.String("remote", rpcCtx.RemoteAddr),
 		zap.Int("payloadSize", len(rpcCtx.Payload)))
-
-	// Example: You can modify the payload here if needed.
 	return util.VerdictPass, ctx, nil
 }
 
-// ProcessResponse processes outgoing responses.
+// ProcessResponse processes outgoing responses (always pass).
 func (e *ExampleElement) ProcessResponse(ctx context.Context, rpcCtx *util.GRPCContext) (util.Verdict, context.Context, error) {
 	if rpcCtx == nil {
 		return util.VerdictPass, ctx, nil
@@ -45,8 +61,6 @@ func (e *ExampleElement) ProcessResponse(ctx context.Context, rpcCtx *util.GRPCC
 		zap.String("method", rpcCtx.Method),
 		zap.String("remote", rpcCtx.RemoteAddr),
 		zap.Int("payloadSize", len(rpcCtx.Payload)))
-
-	// Example: You can modify the payload here if needed.
 	return util.VerdictPass, ctx, nil
 }
 
@@ -73,8 +87,11 @@ func (e *ExampleElementInit) Element() interface{} {
 	return e.element
 }
 
-// Init is called when the plugin is loaded.
-func (e *ExampleElementInit) Init() {}
+// Init is called when the plugin is loaded. Seeds RNG for 50% drop probability.
+func (e *ExampleElementInit) Init() {
+	e.element.rng = rand.New(rand.NewSource(time.Now().UnixNano()))
+	logging.Info("ExampleElement: init, 50% drop probability for requests")
+}
 
 // Kill is called when the plugin is being unloaded (optional cleanup)
 func (e *ExampleElementInit) Kill() {

@@ -391,6 +391,8 @@ func (s *ProxyState) streamHandler(srv interface{}, ss grpc.ServerStream) error 
 	}
 
 	ctx := ss.Context()
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
 
 	target, err := s.getBackendTarget(ctx)
 	if err != nil {
@@ -424,7 +426,7 @@ func (s *ProxyState) streamHandler(srv interface{}, ss grpc.ServerStream) error 
 		ServerStreams: true,
 	}
 
-	clientStream, err := cc.NewStream(ctx, desc, fullMethod)
+	clientStream, err := cc.NewStream(streamCtx, desc, fullMethod)
 	if err != nil {
 		logging.Error("Failed to create backend stream",
 			zap.String("target", target),
@@ -458,9 +460,10 @@ func (s *ProxyState) streamHandler(srv interface{}, ss grpc.ServerStream) error 
 				return
 			}
 
-			if s.elementChain != nil {
+			chain := GetElementChain()
+			if chain != nil {
 				rpcCtx := buildRPCContext(ctx, fullMethod, in, true)
-				verdict, _, err := s.elementChain.ProcessRequest(ctx, rpcCtx)
+				verdict, _, err := chain.ProcessRequest(ctx, rpcCtx)
 				if err != nil {
 					logging.Error("Element chain request processing error",
 						zap.String("method", fullMethod),
@@ -472,7 +475,9 @@ func (s *ProxyState) streamHandler(srv interface{}, ss grpc.ServerStream) error 
 					logging.Debug("Request dropped by element chain",
 						zap.String("method", fullMethod),
 						zap.String("backend", target))
-					errCh <- status.Error(codes.PermissionDenied, "dropped by element chain")
+					ss.SetTrailer(metadata.Pairs("x-dropped-by-element", "request"))
+					_ = clientStream.CloseSend() // unblock backend->client goroutine so process does not get stuck
+					errCh <- status.Error(codes.PermissionDenied, "request dropped by element chain")
 					return
 				}
 				in = rpcCtx.Payload
@@ -526,9 +531,10 @@ func (s *ProxyState) streamHandler(srv interface{}, ss grpc.ServerStream) error 
 				return
 			}
 
-			if s.elementChain != nil {
+			chain := GetElementChain()
+			if chain != nil {
 				rpcCtx := buildRPCContext(ctx, fullMethod, in, false)
-				verdict, _, err := s.elementChain.ProcessResponse(ctx, rpcCtx)
+				verdict, _, err := chain.ProcessResponse(ctx, rpcCtx)
 				if err != nil {
 					logging.Error("Element chain response processing error",
 						zap.String("method", fullMethod),
@@ -540,7 +546,9 @@ func (s *ProxyState) streamHandler(srv interface{}, ss grpc.ServerStream) error 
 					logging.Debug("Response dropped by element chain",
 						zap.String("method", fullMethod),
 						zap.String("backend", target))
-					errCh <- status.Error(codes.PermissionDenied, "dropped by element chain")
+					ss.SetTrailer(metadata.Pairs("x-dropped-by-element", "response"))
+					_ = clientStream.CloseSend() // signal backend so client->backend goroutine can finish
+					errCh <- status.Error(codes.PermissionDenied, "response dropped by element chain")
 					return
 				}
 				in = rpcCtx.Payload
@@ -578,6 +586,7 @@ func (s *ProxyState) streamHandler(srv interface{}, ss grpc.ServerStream) error 
 	for i := 0; i < 2; i++ {
 		if e := <-errCh; e != nil && firstErr == nil {
 			firstErr = e
+			cancelStream() // unblock the other goroutine so we don't get stuck (e.g. on drop)
 		}
 	}
 
