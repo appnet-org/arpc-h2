@@ -10,18 +10,24 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"unsafe"
 
 	"github.com/appnet-org/arpc/pkg/logging"
+	kv "github.com/appnet-org/proxy-h2/grpc-buffering/kvproto"
 	"go.uber.org/zap"
 	"golang.org/x/sys/unix"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/encoding"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 //====================
@@ -57,6 +63,9 @@ type ProxyState struct {
 
 	// Connection pool: backend target ("ip:port") -> *grpc.ClientConn.
 	connPool sync.Map
+
+	// Element chain for request/response processing.
+	elementChain *RPCElementChain
 }
 
 //====================
@@ -180,6 +189,106 @@ func (rawCodec) Unmarshal(data []byte, v interface{}) error {
 func init() {
 	// Register codec so that content-type negotiation can find it if needed.
 	encoding.RegisterCodec(rawCodec{})
+}
+
+//====================
+// KVStore protobuf decoding (best-effort)
+//====================
+
+const maxLoggedString = 256
+
+func truncateForLog(s string) string {
+	if len(s) <= maxLoggedString {
+		return s
+	}
+	return s[:maxLoggedString] + "...(truncated)"
+}
+
+func buildRPCContext(ctx context.Context, fullMethod string, payload []byte, isRequest bool) *GRPCContext {
+	headers := Headers{}
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		for k, vals := range md {
+			// Metadata keys are lowercase; enforce just in case.
+			headers[strings.ToLower(k)] = append([]string(nil), vals...)
+		}
+	}
+
+	rpcCtx := &GRPCContext{
+		Headers:   headers,
+		Payload:   append([]byte(nil), payload...),
+		IsRequest: isRequest,
+		Method:    fullMethod,
+	}
+
+	if p, ok := peer.FromContext(ctx); ok && p.Addr != nil {
+		rpcCtx.RemoteAddr = p.Addr.String()
+	}
+
+	return rpcCtx
+}
+
+func kvDecodeFieldsForMethod(fullMethod string, msg []byte, direction string) ([]zap.Field, bool) {
+	// Note: in your logs methods show up like "/kv.KVService/set" (lowercase).
+	m := strings.ToLower(fullMethod)
+
+	switch {
+	case strings.HasSuffix(m, "/kv.kvservice/get") && direction == "req":
+		var req kv.GetRequest
+		if err := proto.Unmarshal(msg, &req); err != nil {
+			logging.Debug("KV decode failed (GetRequest)", zap.String("method", fullMethod), zap.Error(err))
+			return nil, false
+		}
+		key := req.GetKey()
+		return []zap.Field{
+			zap.String("kv_type", "GetRequest"),
+			zap.Int("kv_key_len", len(key)),
+			zap.String("kv_key", truncateForLog(key)),
+		}, true
+
+	case strings.HasSuffix(m, "/kv.kvservice/set") && direction == "req":
+		var req kv.SetRequest
+		if err := proto.Unmarshal(msg, &req); err != nil {
+			logging.Debug("KV decode failed (SetRequest)", zap.String("method", fullMethod), zap.Error(err))
+			return nil, false
+		}
+		key := req.GetKey()
+		val := req.GetValue()
+		return []zap.Field{
+			zap.String("kv_type", "SetRequest"),
+			zap.Int("kv_key_len", len(key)),
+			zap.String("kv_key", truncateForLog(key)),
+			zap.Int("kv_value_len", len(val)),
+			zap.String("kv_value", truncateForLog(val)),
+		}, true
+
+	case strings.HasSuffix(m, "/kv.kvservice/get") && direction == "resp":
+		var resp kv.GetResponse
+		if err := proto.Unmarshal(msg, &resp); err != nil {
+			logging.Debug("KV decode failed (GetResponse)", zap.String("method", fullMethod), zap.Error(err))
+			return nil, false
+		}
+		val := resp.GetValue()
+		return []zap.Field{
+			zap.String("kv_type", "GetResponse"),
+			zap.Int("kv_value_len", len(val)),
+			zap.String("kv_value", truncateForLog(val)),
+		}, true
+
+	case strings.HasSuffix(m, "/kv.kvservice/set") && direction == "resp":
+		var resp kv.SetResponse
+		if err := proto.Unmarshal(msg, &resp); err != nil {
+			logging.Debug("KV decode failed (SetResponse)", zap.String("method", fullMethod), zap.Error(err))
+			return nil, false
+		}
+		val := resp.GetValue()
+		return []zap.Field{
+			zap.String("kv_type", "SetResponse"),
+			zap.Int("kv_value_len", len(val)),
+			zap.String("kv_value", truncateForLog(val)),
+		}, true
+	}
+
+	return nil, false
 }
 
 //====================
@@ -347,11 +456,40 @@ func (s *ProxyState) streamHandler(srv interface{}, ss grpc.ServerStream) error 
 				}
 				return
 			}
+
+			if s.elementChain != nil {
+				rpcCtx := buildRPCContext(ctx, fullMethod, in, true)
+				verdict, _, err := s.elementChain.ProcessRequest(ctx, rpcCtx)
+				if err != nil {
+					logging.Error("Element chain request processing error",
+						zap.String("method", fullMethod),
+						zap.Error(err))
+					errCh <- err
+					return
+				}
+				if verdict == VerdictDrop {
+					logging.Debug("Request dropped by element chain",
+						zap.String("method", fullMethod),
+						zap.String("backend", target))
+					errCh <- status.Error(codes.PermissionDenied, "dropped by element chain")
+					return
+				}
+				in = rpcCtx.Payload
+			}
+
 			logging.Debug("Proxy hooked gRPC message: client -> backend",
 				zap.String("method", fullMethod),
 				zap.String("backend", target),
 				zap.Int("msg_size", len(in)),
 			)
+			if kvFields, ok := kvDecodeFieldsForMethod(fullMethod, in, "req"); ok {
+				logging.Debug("Decoded KVStore gRPC payload: client -> backend",
+					append([]zap.Field{
+						zap.String("method", fullMethod),
+						zap.String("backend", target),
+					}, kvFields...)...,
+				)
+			}
 
 			if err := clientStream.SendMsg(in); err != nil {
 				logging.Debug("Client -> Backend SendMsg error",
@@ -387,12 +525,40 @@ func (s *ProxyState) streamHandler(srv interface{}, ss grpc.ServerStream) error 
 				return
 			}
 
+			if s.elementChain != nil {
+				rpcCtx := buildRPCContext(ctx, fullMethod, in, false)
+				verdict, _, err := s.elementChain.ProcessResponse(ctx, rpcCtx)
+				if err != nil {
+					logging.Error("Element chain response processing error",
+						zap.String("method", fullMethod),
+						zap.Error(err))
+					errCh <- err
+					return
+				}
+				if verdict == VerdictDrop {
+					logging.Debug("Response dropped by element chain",
+						zap.String("method", fullMethod),
+						zap.String("backend", target))
+					errCh <- status.Error(codes.PermissionDenied, "dropped by element chain")
+					return
+				}
+				in = rpcCtx.Payload
+			}
+
 			// ADD: this log means you have received a *complete gRPC message* from the backend
 			logging.Debug("Proxy hooked gRPC message: backend -> client",
 				zap.String("method", fullMethod),
 				zap.String("backend", target),
 				zap.Int("msg_size", len(in)),
 			)
+			if kvFields, ok := kvDecodeFieldsForMethod(fullMethod, in, "resp"); ok {
+				logging.Debug("Decoded KVStore gRPC payload: backend -> client",
+					append([]zap.Field{
+						zap.String("method", fullMethod),
+						zap.String("backend", target),
+					}, kvFields...)...,
+				)
+			}
 
 			if err := ss.SendMsg(in); err != nil {
 				logging.Debug("Backend -> Client SendMsg error",
@@ -511,8 +677,11 @@ func main() {
 
 	config := DefaultConfig()
 
+	elementChain := NewRPCElementChain(&FirewallElement{})
+
 	state := &ProxyState{
-		targetAddr: config.TargetAddr,
+		targetAddr:   config.TargetAddr,
+		elementChain: elementChain,
 	}
 
 	logging.Info("Proxy target configured",
